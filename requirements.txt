@@ -1,5 +1,5 @@
-fastapi
-httpx
-uvicorn
-mangum
-python-dotenv
+fastapi==0.141.1
+httpx==0.28.1
+uvicorn==0.54.0
+mangum==0.22.0
+python-dotenv==1.2.3

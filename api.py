@@ -1,59 +1,125 @@
-import base64, json, gzip, httpx, os
+import asyncio
+import base64
+import gzip
+import hashlib
+import json
+import os
+import time
+from collections import defaultdict
+from typing import Optional
+
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Miruro API", version="2.0")
+app = FastAPI(title="Miruro API", version="2.0", description="Public anime metadata and streaming-source API")
 
-# --- Security Configuration ---
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",")
-API_KEY_NAME = "x-api-key"
+# Public API CORS: wildcard origins are safe because credentials are deliberately disabled.
+_origins = os.getenv("ALLOWED_ORIGINS", "*").strip()
+ALLOWED_ORIGINS = [origin.strip() for origin in _origins.split(",") if origin.strip()] or ["*"]
 VALID_API_KEY = os.getenv("API_KEY")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["Accept", "Content-Type", "Origin", "User-Agent", "X-API-Key"],
 )
 
+# A small per-process guard protects the upstreams without requiring a database.
+RATE_LIMIT = max(1, int(os.getenv("RATE_LIMIT_PER_MINUTE", "120")))
+_rate_buckets = defaultdict(list)
+_rate_lock = asyncio.Lock()
+
 @app.middleware("http")
-async def secure_api(request: Request, call_next):
-    # Allow home page (docs) without restrictions
-    if request.url.path in ["/", "/docs", "/redoc", "/openapi.json"]:
-        return await call_next(request)
-
-    # 1. Check API Key
-    api_key = request.headers.get(API_KEY_NAME)
-    if VALID_API_KEY and api_key == VALID_API_KEY:
-        return await call_next(request)
-
-    # 2. Check Origin or Referer
-    origin = request.headers.get("origin")
-    referer = request.headers.get("referer")
-
-    is_allowed = False
-    for allowed in ALLOWED_ORIGINS:
-        if (origin and origin.startswith(allowed)) or (referer and referer.startswith(allowed)):
-            is_allowed = True
-            break
-            
-    if not is_allowed:
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "Access forbidden: Invalid Origin, Referer, or API Key."}
-        )
-
+async def public_rate_limit(request: Request, call_next):
+    if VALID_API_KEY and request.url.path not in {"/", "/docs", "/redoc", "/openapi.json", "/health"}:
+        if request.headers.get("x-api-key") != VALID_API_KEY:
+            return JSONResponse(status_code=401, content={"error": "Invalid or missing API key"})
+    now = time.monotonic()
+    client_ip = request.client.host if request.client else "unknown"
+    bucket = f"{client_ip}:{request.url.path}"
+    async with _rate_lock:
+        recent = [stamp for stamp in _rate_buckets[bucket] if now - stamp < 60]
+        if len(recent) >= RATE_LIMIT:
+            return JSONResponse(status_code=429, content={"error": "Rate limit exceeded", "retry_after_seconds": 60}, headers={"Retry-After": "60"})
+        recent.append(now)
+        _rate_buckets[bucket] = recent
+        if len(_rate_buckets) > 10000:
+            _rate_buckets.clear()
     return await call_next(request)
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": "https://www.miruro.online/"}
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
+    return JSONResponse(status_code=exc.status_code, content={"error": detail})
+
+@app.exception_handler(StarletteHTTPException)
+async def starlette_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"error": "Route not found" if exc.status_code == 404 else "Request failed"})
+
+@app.exception_handler(404)
+async def not_found_handler(request: Request, exc):
+    return JSONResponse(status_code=404, content={"error": "Route not found"})
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"error": "Invalid request", "details": exc.errors()})
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content={"error": "Internal server error"})
+
+HEADERS = {"User-Agent": "Miruro-API/2.0", "Referer": "https://www.miruro.online/"}
 ANILIST_URL = "https://graphql.anilist.co"
 MIRURO_PIPE_URL = "https://www.miruro.to/api/secure/pipe"
+_HTTP_CLIENT = None
+_CACHE = {}
+_CACHE_LOCK = asyncio.Lock()
+_CACHE_TTL_SECONDS = max(0, int(os.getenv("CACHE_TTL_SECONDS", "30")))
+
+async def _get_http_client():
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:
+        _HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        )
+    return _HTTP_CLIENT
+
+@app.on_event("shutdown")
+async def close_http_client():
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is not None and not _HTTP_CLIENT.is_closed:
+        await _HTTP_CLIENT.aclose()
+        _HTTP_CLIENT = None
+
+async def _cached(key: str, loader, ttl: int = _CACHE_TTL_SECONDS):
+    if ttl <= 0:
+        return await loader()
+    now = time.monotonic()
+    async with _CACHE_LOCK:
+        cached = _CACHE.get(key)
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+    value = await loader()
+    async with _CACHE_LOCK:
+        _CACHE[key] = (time.monotonic(), value)
+        if len(_CACHE) > 500:
+            oldest = min(_CACHE, key=lambda item: _CACHE[item][0])
+            _CACHE.pop(oldest, None)
+    return value
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "miruro-api", "version": "2.0"}
 
 def _proxy_img(url: str) -> str:
     # Proxy removed — return original image URL
@@ -92,6 +158,11 @@ def _inject_source_slugs(data: dict, anilist_id: int):
 
 async def _fetch_raw_episodes(anilist_id: int) -> dict:
     """Internal helper to fetch raw, decoded episode data from Miruro pipe."""
+    async def load():
+        return await _fetch_raw_episodes_uncached(anilist_id)
+    return await _cached(f"episodes:{anilist_id}", load)
+
+async def _fetch_raw_episodes_uncached(anilist_id: int) -> dict:
     payload = {
         "path": "episodes",
         "method": "GET",
@@ -100,13 +171,20 @@ async def _fetch_raw_episodes(anilist_id: int) -> dict:
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    try:
+        client = await _get_http_client()
         res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
         if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail="Pipe request failed")
+            raise HTTPException(status_code=502, detail="Episode provider unavailable")
         data = _decode_pipe_response(res.text.strip())
         _deep_translate(data)
         return data
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Episode provider timed out")
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError):
+        raise HTTPException(status_code=502, detail="Invalid response from episode provider")
 
 # ─── Shared GraphQL Fragments ────────────────────────────────────────────────
 
@@ -260,15 +338,30 @@ def _encode_pipe_request(payload: dict) -> str:
 
 
 async def _anilist_query(query: str, variables: dict = None):
-    """Execute an AniList GraphQL query and return the data."""
+    """Execute an AniList GraphQL query with short-lived response caching."""
     body = {"query": query}
     if variables:
         body["variables"] = variables
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.post(ANILIST_URL, json=body)
-        if res.status_code != 200:
-            raise HTTPException(status_code=500, detail="AniList query failed")
-        return res.json().get("data", {})
+    cache_key = "anilist:" + hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+
+    async def load():
+        try:
+            client = await _get_http_client()
+            res = await client.post(ANILIST_URL, json=body)
+            if res.status_code != 200:
+                raise HTTPException(status_code=502, detail="AniList provider unavailable")
+            payload = res.json()
+            if payload.get("errors"):
+                raise HTTPException(status_code=502, detail="AniList provider returned an error")
+            return payload.get("data", {})
+        except HTTPException:
+            raise
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=504, detail="AniList provider timed out")
+        except (httpx.HTTPError, ValueError, json.JSONDecodeError):
+            raise HTTPException(status_code=502, detail="Invalid response from AniList")
+
+    return await _cached(cache_key, load)
 
 
 # ─── Homepage ────────────────────────────────────────────────────────────────
@@ -483,7 +576,7 @@ async def home():
             <div><span class="step-num">2</span> <span class="url">/watch/{provider}/{anilistId}/{category}/{slug}</span> <span class="badge badge-new">RECOMMENDED</span></div>
             <div class="desc">The super simple way to get sources. Just take the direct <b>id</b> from the Step 1 response and use it as the URL. No manual parameters needed!</div>
             <div class="example">Try: <a target="_blank" href="/watch/kiwi/178005/sub/animepahe-1">/watch/kiwi/178005/sub/animepahe-1</a></div>
-            
+
             <pre class="snippet">{
   "streams": [
     { "url": "https://.../master.m3u8", "type": "hls", "quality": "1080p" }
@@ -987,11 +1080,18 @@ async def get_sources(
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    try:
+        client = await _get_http_client()
         res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
         if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail="Pipe request failed")
+            raise HTTPException(status_code=502, detail="Streaming provider unavailable")
         return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Streaming provider timed out")
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError):
+        raise HTTPException(status_code=502, detail="Invalid response from streaming provider")
 
 @app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
 async def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):
@@ -999,7 +1099,7 @@ async def get_watch_sources(provider: str, anilist_id: int, category: str, slug:
     data = await _fetch_raw_episodes(anilist_id)
     prov_data = data.get("providers", {}).get(provider, {})
     ep_list = prov_data.get("episodes", {}).get(category, [])
-    
+
     # Resolve the slug back to the original ID
     target_id = None
     for ep in ep_list:
@@ -1009,8 +1109,8 @@ async def get_watch_sources(provider: str, anilist_id: int, category: str, slug:
         if generated == slug:
             target_id = orig_id
             break
-            
+
     if not target_id:
         raise HTTPException(status_code=404, detail=f"Episode slug '{slug}' not found for provider {provider}")
-        
+
     return await get_sources(episodeId=target_id, provider=provider, anilistId=anilist_id, category=category)

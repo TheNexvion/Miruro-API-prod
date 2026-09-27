@@ -197,3 +197,64 @@ This project is for educational purposes and API integrity research only. The au
 <br>
 
 **Author:** Walter | **GitHub:** [walterwhite-69](https://github.com/walterwhite-69)
+
+
+## Production API service
+
+The service is a stateless FastAPI application and is suitable for Render, Docker, or another HTTPS platform. It exposes JSON API routes plus the standard FastAPI documentation pages.
+
+### Base URL
+
+The deployed base URL is published with the deployment details for this repository. The health check is `GET /health`.
+
+### Endpoints
+
+- `GET /health`
+- `GET /search?query={name}&page=1&per_page=20`
+- `GET /suggestions?query={name}`
+- `GET /filter` with optional `genre`, `tag`, `year`, `season`, `format`, `status`, `sort`, `page`, and `per_page`
+- `GET /spotlight`, `/trending`, `/popular`, `/upcoming`, `/recent`, `/schedule` with `page` and `per_page`
+- `GET /info/{anilist_id}`
+- `GET /anime/{anilist_id}/characters?page=1&per_page=25`
+- `GET /anime/{anilist_id}/relations`
+- `GET /anime/{anilist_id}/recommendations?page=1&per_page=10`
+- `GET /episodes/{anilist_id}`
+- `GET /sources?episodeId=...&provider=...&anilistId=...&category=sub`
+- `GET /watch/{provider}/{anilist_id}/{category}/{slug}`
+
+Example:
+
+```bash
+curl https://YOUR_PUBLIC_HOST/health
+curl 'https://YOUR_PUBLIC_HOST/search?query=one%20piece'
+```
+
+Errors use JSON responses such as `{ "error": "Route not found" }`, `{ "error": "Invalid request", "details": [...] }`, `429` for rate limiting, `502` for upstream provider failures, and `504` for upstream timeouts.
+
+### Configuration
+
+All environment variables are optional:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `ALLOWED_ORIGINS` | `*` | Comma-separated browser origins. Credentials are disabled for safe public CORS. |
+| `RATE_LIMIT_PER_MINUTE` | `120` | Per-process limit per client IP and route. |
+| `CACHE_TTL_SECONDS` | `30` | In-memory cache TTL for safe metadata and episode responses. |
+| `API_KEY` | unset | Optional `X-API-Key` value for clients that need an additional shared-secret gate. |
+
+### Local production-style run
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+PORT=8000 .venv/bin/uvicorn api:app --host 0.0.0.0 --port 8000 --proxy-headers
+```
+
+### Container run
+
+```bash
+docker build -t miruro-api .
+docker run --rm -p 8000:8000 miruro-api
+```
+
+The platform must route its HTTPS health check to `/health`, set `PORT` when required, and provide the optional variables above through its secret/environment configuration rather than committing a `.env` file.
