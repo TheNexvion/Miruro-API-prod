@@ -205,7 +205,7 @@ The service is a stateless FastAPI application and is suitable for Render, Docke
 
 ### Base URL
 
-The deployed base URL is published with the deployment details for this repository. The health check is `GET /health`.
+The public base URL is `https://miruro-api-prod-us.onrender.com`. The health check is `GET /health`.
 
 ### Endpoints
 
@@ -225,8 +225,8 @@ The deployed base URL is published with the deployment details for this reposito
 Example:
 
 ```bash
-curl https://YOUR_PUBLIC_HOST/health
-curl 'https://YOUR_PUBLIC_HOST/search?query=one%20piece'
+curl https://miruro-api-prod-us.onrender.com/health
+curl 'https://miruro-api-prod-us.onrender.com/search?query=one%20piece'
 ```
 
 Errors use JSON responses such as `{ "error": "Route not found" }`, `{ "error": "Invalid request", "details": [...] }`, `429` for rate limiting, `502` for upstream provider failures, and `504` for upstream timeouts.
